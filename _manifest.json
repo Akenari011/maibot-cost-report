@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "github.lbcheng1145.cost-report",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "name": "开销统计",
-  "description": "查询麦麦的 token 消耗和模型花费，默认看最近 24 小时。支持命令和 LLM 工具调用。",
+  "description": "查询麦麦的 token 消耗和模型花费，卡片布局对齐 WebUI 统计页：统计概览（含环比与迷你柱状图）、Prompt 缓存、模型花费分布、Token 流向拆解、单位成本与效率。支持命令和 LLM 工具调用。",
   "author": {
     "name": "Lbcheng1145",
     "url": "https://github.com/Lbcheng1145"
