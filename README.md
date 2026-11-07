@@ -21,8 +21,8 @@
 
 | 组件 | 版本 | 说明 |
 | --- | --- | --- |
-| MaiBot | 1.3.x | manifest 里声明的区间是 `1.3.0` ～ `1.3.99` |
-| `maibot-plugin-sdk` | 2.4.0 起 | 插件用了 2.4.0 才引入的 `PluginConfigBase`，再低的版本会在 `import` 阶段就失败 |
+| MaiBot | 1.3.x / 1.4.x | manifest 里声明的区间是 `1.3.0` ～ `1.4.99` |
+| `maibot-plugin-sdk` | 2.4.0 起 | 插件用了 2.4.0 才引入的 `PluginConfigBase`，再低的版本会在 `import` 阶段就失败。2.21.0 已验证 |
 
 SDK 版本超出 manifest 区间时宿主只记 warning、仍会加载，所以下界不要写低——写在 2.0.0 的话，2.0～2.3 的环境里表现是「加载成功然后 ImportError」。
 
