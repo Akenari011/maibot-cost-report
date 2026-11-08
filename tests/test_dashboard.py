@@ -776,6 +776,73 @@ def test_used_models_decoupled():
         check_true("不含纯显示名", "gemini-x" not in names)
 
 
+
+def test_quota_skips_non_window():
+    """Credits / Tokens(est.) 这类不是 7天/5小时窗口，不能塞进配额条。"""
+    print("--- 配额只收 7天/5小时 窗口 ---")
+    quotas = {"data": [
+        {  # workbuddy 一个账户：全是 Credits 类窗口
+            "provider": "workbuddy", "plan": "Free plan", "user": "a",
+            "windows": [
+                {"name": "Credits", "used": 0},
+                {"name": "Extra credits", "used": 11.4},
+                {"name": "Total credits", "used": 10.5},
+                {"name": "deepseek-v4.1-flash tokens (est.)", "used": 0.2},
+            ],
+        },
+        {  # antigravity：标准 7天/5小时
+            "provider": "antigravity", "plan": "Google AI Pro", "user": "b",
+            "windows": [
+                {"name": "Gemini · 7 days", "pool": "Gemini", "used": 2.6},
+                {"name": "Gemini · 5 hours", "pool": "Gemini", "used": 2.8},
+                {"name": "Claude & GPT · 7 days", "pool": "Claude & GPT", "used": 0},
+            ],
+        },
+    ]}
+    out = magpie._parse_quota(quotas)
+    names = {e["provider"] for e in out["providers"]}
+    check("workbuddy 无配额窗口被排除", "workbuddy" in names, False)
+    check_true("antigravity 保留", "antigravity" in names)
+    ag = next(e for e in out["providers"] if e["provider"] == "antigravity")
+    check("只剩 Gemini / Claude & GPT 两个池", sorted(ag["pools"]), ["Claude & GPT", "Gemini"])
+    check("Gemini 7d", round(ag["pools"]["Gemini"]["quota_7d"], 2), 2.6)
+    check("Gemini 5h", round(ag["pools"]["Gemini"]["quota_5h"], 2), 2.8)
+
+
+def test_quota_merges_accounts():
+    """同一 provider 多个账户合并成一条，取已用最大的。"""
+    print("--- 多账户配额合并 ---")
+    quotas = {"data": [
+        {"provider": "workbuddy", "plan": "Free plan", "user": "acc1",
+         "windows": [{"name": "Gemini · 7 days", "pool": "Gemini", "used": 1.0},
+                     {"name": "Gemini · 5 hours", "pool": "Gemini", "used": 0.5}]},
+        {"provider": "workbuddy", "plan": "Free plan", "user": "acc2",
+         "windows": [{"name": "Gemini · 7 days", "pool": "Gemini", "used": 5.0},
+                     {"name": "Gemini · 5 hours", "pool": "Gemini", "used": 3.0}]},
+        {"provider": "workbuddy", "plan": "Free plan", "user": "acc3",
+         "windows": [{"name": "Gemini · 7 days", "pool": "Gemini", "used": 2.0}]},
+    ]}
+    out = magpie._parse_quota(quotas)
+    check("同 provider 只出一条", len(out["providers"]), 1)
+    pools = out["providers"][0]["pools"]
+    check("7d 取最大 5.0", round(pools["Gemini"]["quota_7d"], 1), 5.0)
+    check("5h 取最大 3.0", round(pools["Gemini"]["quota_5h"], 1), 3.0)
+
+
+def test_match_pools_no_tokens_est():
+    """池子名带模型名的（tokens (est.)）不能被误当成该模型的配额池。"""
+    print("--- tokens(est.) 不误匹配 ---")
+    quotas = {"data": [{
+        "provider": "workbuddy", "plan": "Free plan", "user": "a",
+        "windows": [{"name": "deepseek-v4.1-flash tokens (est.)", "used": 0.2}],
+    }]}
+    parsed = magpie._parse_quota(quotas)
+    check("非配额窗口全部跳过，providers 为空", parsed["providers"], [])
+    # 即使强行拿它匹配，也没有池子可用
+    matched = magpie.match_pools(["deepseek-v4.1-flash"], parsed["providers"])
+    check("匹配结果为空", matched, [])
+
+
 def run(round_no: int) -> bool:
     print(f"\n===== 第 {round_no} 轮 =====")
     before = len(RESULTS)
@@ -802,6 +869,9 @@ def run(round_no: int) -> bool:
     test_fx_cache()
     test_fetch_usd_cny_range()
     test_used_models_decoupled()
+    test_quota_skips_non_window()
+    test_quota_merges_accounts()
+    test_match_pools_no_tokens_est()
     return all(RESULTS[before:])
 
 

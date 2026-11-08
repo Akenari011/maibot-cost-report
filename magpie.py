@@ -59,44 +59,63 @@ def _pick_day(usage: dict[str, Any], label: str) -> dict[str, Any]:
 
 
 def _parse_quota(quotas: dict[str, Any]) -> dict[str, Any]:
-    """解析所有 provider 的所有配额池。
+    """解析配额池，只保留真正的「7 天 / 5 小时」窗口。
 
-    一个 provider（比如 antigravity）下面可能挂着多个池子：Gemini、Claude & GPT 各自
-    有 7 天 / 5 小时两个窗口。这里全部保留，由调用方按「MaiBot 实际调了哪些模型」
-    去挑该显示哪几个，不要写死只认 Gemini。
+    magpie 的 quotas 里，同一个 provider 可能返回多条（每个账户一条），
+    且窗口类型五花八门：`Gemini · 7 days`、`Credits`、`Extra credits`、
+    `deepseek-v4.1-flash tokens (est.)`……
+
+    只有 `7 days` / `5 hours` 是配额百分比，其它（Credits、token 估算）
+    语义不同、没有百分比，硬塞进 7 天/5 小时槽位只会渲染出一堆「—」。
+    所以这里只收这两类，其余跳过；同一 provider 的多个账户合并成一条，
+    同一池子取「已用最多」的那个（最紧要，宁可早预警）。
     """
-    providers: list[dict[str, Any]] = []
+    merged: dict[str, dict[str, Any]] = {}
     for item in quotas.get("data") or []:
         if not isinstance(item, dict):
             continue
-        pools: dict[str, dict[str, Any]] = {}
+        provider = str(item.get("provider") or "").strip()
+        if not provider:
+            continue
+        entry = merged.setdefault(provider, {
+            "provider": provider,
+            "plan": str(item.get("plan") or ""),
+            "account": "",
+            "pools": {},
+        })
+        if not entry["plan"]:
+            entry["plan"] = str(item.get("plan") or "")
         for window in item.get("windows") or []:
             if not isinstance(window, dict):
                 continue
             name = str(window.get("name") or "")
+            is_7d = "7 days" in name or "7 天" in name
+            is_5h = "5 hours" in name or "5 小时" in name
+            if not (is_7d or is_5h):
+                # Credits / Extra credits / Tokens(est.) 之类不是配额窗口，跳过
+                continue
             pool = str(window.get("pool") or "").strip()
             if not pool:
                 # 老版本没 pool 字段时从 name 里推：`Gemini · 7 days` -> Gemini
-                pool = name.split("·")[0].strip() if "·" in name else name
+                pool = name.split("·")[0].strip() if "·" in name else ""
             if not pool:
                 continue
-            slot = pools.setdefault(
+            slot = entry["pools"].setdefault(
                 pool,
                 {"quota_7d": None, "quota_5h": None, "reset_7d": None, "reset_5h": None},
             )
-            if "7 days" in name or "7 天" in name:
-                slot["quota_7d"] = window.get("used")
-                slot["reset_7d"] = window.get("resetsAt")
-            elif "5 hours" in name or "5 小时" in name:
-                slot["quota_5h"] = window.get("used")
-                slot["reset_5h"] = window.get("resetsAt")
-        if pools:
-            providers.append({
-                "provider": str(item.get("provider") or ""),
-                "plan": str(item.get("plan") or ""),
-                "account": str(item.get("user") or ""),
-                "pools": pools,
-            })
+            used = window.get("used")
+            key = "quota_7d" if is_7d else "quota_5h"
+            reset_key = "reset_7d" if is_7d else "reset_5h"
+            if used is None:
+                continue
+            current = slot[key]
+            # 多账户：取已用百分比最大的，最紧要
+            if current is None or float(used) > float(current):
+                slot[key] = used
+                slot[reset_key] = window.get("resetsAt")
+
+    providers = [e for e in merged.values() if e.get("pools")]
     return {"providers": providers}
 
 
