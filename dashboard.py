@@ -413,6 +413,7 @@ def collect(
     prev_extra_by_model: dict[str, float] | None = None,
     pricing: dict[str, dict[str, float]] | None = None,
     usd_rate: float = 7.2,
+    apply_pricing: bool = True,
 ) -> dict[str, Any] | None:
     """采集一个完整周期的看板数据。数据库打不开返回 None。
 
@@ -442,14 +443,18 @@ def collect(
         msg_series = _message_hourly(con, start, days)
         # 单价计算必须在 con 关闭之前：conn.close() 之后再查会抛异常，
         # 异常被外层吞掉就表现为「传了 pricing 但成本没变」。
+        # 实际调用过的模型：不管计不计入成本都要有，用来决定卡片展示哪些配额池
+        current["used_models"] = used_models(con, start, end)
         if pricing:
             usage_detail = priced_usage(con, start, end, pricing, usd_rate)
-            extra_by_model = {
-                **(extra_by_model or {}),
-                **{name: item["cost"] for name, item in usage_detail.items()},
-            }
-            # 供卡片底部展示「本窗口调用 / token / 成本」，和总花费里的部分是同一份数据
+            # 供卡片底部展示「本窗口调用 / token / 成本」
             current["priced_usage"] = usage_detail
+            # apply_pricing 关掉时只展示不并入总花费
+            if apply_pricing:
+                extra_by_model = {
+                    **(extra_by_model or {}),
+                    **{name: item["cost"] for name, item in usage_detail.items()},
+                }
             prev_extra_by_model = {
                 **(prev_extra_by_model or {}),
                 **priced_cost(con, prev_start, prev_end, pricing, usd_rate),
@@ -588,3 +593,26 @@ def priced_usage(
             "cost": round(usd * float(usd_rate), 6),
         }
     return out
+
+
+def used_models(con: sqlite3.Connection, start: datetime, end: datetime) -> list[str]:
+    """窗口内 MaiBot 实际调用过的模型名（取 model_identifier，和网关的模型 id 对齐）。
+
+    和 `priced_cost` 不同，这个不依赖定价表——即使不计入账面成本，
+    也要能判断该在卡片上展示哪些模型，不能退回网关的请求明细
+    （那里混着别的 agent 和 magpie 自己探测 provider 的记录）。
+    """
+    if not _table_exists(con, "llm_usage"):
+        return []
+    try:
+        rows = con.execute(
+            """
+            SELECT DISTINCT COALESCE(NULLIF(model_name, ''), NULLIF(model_assign_name, ''), 'Unknown')
+            FROM llm_usage
+            WHERE timestamp >= ? AND timestamp < ?
+            """,
+            (_fmt(start), _fmt(end)),
+        ).fetchall()
+    except Exception:
+        return []
+    return sorted(str(r[0]) for r in rows if r and r[0])

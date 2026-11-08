@@ -571,6 +571,7 @@ class CostReportPlugin(MaiBotPlugin):
         prev_extra_by_model: dict[str, float] | None = None,
         pricing: dict[str, dict[str, float]] | None = None,
         usd_rate: float | None = None,
+        apply_pricing: bool = True,
     ) -> dict[str, Any] | None:
         """采集 WebUI 统计页那套指标。数据库不可用返回 None。
 
@@ -590,6 +591,7 @@ class CostReportPlugin(MaiBotPlugin):
                 usd_rate=usd_rate if usd_rate is not None else float(
                     getattr(self.config.report, "magpie_usd_rate", 7.2) or 7.2
                 ),
+                apply_pricing=apply_pricing,
             )
         except Exception as exc:
             self.ctx.logger.warning("看板数据采集失败，退回简易卡片: %s", exc)
@@ -628,13 +630,12 @@ class CostReportPlugin(MaiBotPlugin):
             prev_window = await asyncio.to_thread(_magpie.collect_window, url, prev_since)
             usd_rate = await self._resolve_usd_rate()
             count_cost = bool(getattr(self.config.report, "magpie_count_cost", True))
-            if count_cost:
-                # 用网关单价 × MaiBot 自己的 token 量算成本：网关明细只有最近 500 条，
-                # 长窗口会截断，而 llm_usage 里有完整历史。
-                pricing = await asyncio.to_thread(_magpie.fetch_pricing, url)
-                if not pricing:
-                    # 拿不到单价就不计入：网关明细里的 cost 是美元，直接加进人民币总额会差 7 倍
-                    self.ctx.logger.debug("magpie 没返回单价表，本次不计入账面成本")
+            # 单价表始终拉：即使不计入总花费，也要用它算「本窗口调用/token」和
+            # 判断该展示哪些配额池。之前只在 count_cost 时拉，关掉后显示会退回
+            # 网关明细，把 magpie 自己探测的 gpt-6-astra 之类也画出来。
+            pricing = await asyncio.to_thread(_magpie.fetch_pricing, url)
+            if not pricing:
+                self.ctx.logger.debug("magpie 没返回单价表，账面成本按 0 处理")
             magpie_data = await asyncio.to_thread(_magpie.collect, url)
             if magpie_data:
                 magpie_data["window"] = cur_window or {}
@@ -643,21 +644,27 @@ class CostReportPlugin(MaiBotPlugin):
                 magpie_data["count_cost"] = bool(
                     getattr(self.config.report, "magpie_count_cost", True)
                 )
-                # 只展示 MaiBot 这个窗口里真正调过的模型对应的配额池，
-                # 没调过的池子（比如 Claude & GPT）不占版面
-                magpie_data["matched"] = _magpie.match_pools(
-                    (cur_window or {}).get("models") or [],
-                    magpie_data.get("providers") or [],
-                )
+
             elif extra_by_model:
                 self.ctx.logger.debug("magpie 详情拉取失败，但窗口成本已并入模型花费")
 
         data = self._collect_dashboard(
-            days, extra_by_model, prev_extra_by_model, pricing or None, usd_rate
+            days, extra_by_model, prev_extra_by_model, pricing or None, usd_rate, count_cost
         )
         if data is not None:
             if magpie_data:
                 # 底部区块用和卡片一致的窗口统计，而不是网关的自然日统计
+                # 只展示 MaiBot 真正调过的模型对应的配额池。
+                # 不能用网关的请求明细：那里混着别的 agent（我调试用的 urllib）、
+                # magpie 自己探测新 provider 的请求，会把没在用的模型和配额池也画出来。
+                # 用 MaiBot 自己记录的模型（llm_usage），不是网关的请求明细
+                used_models = data["current"].get("used_models") or []
+                if not used_models:
+                    used_models = (cur_window or {}).get("models") or []
+                magpie_data["matched"] = _magpie.match_pools(
+                    used_models, magpie_data.get("providers") or []
+                )
+
                 # 用 llm_usage 的完整统计（网关明细只有最近 500 条，长窗口会截断）
                 detail = data["current"].get("priced_usage") or {}
                 if detail:

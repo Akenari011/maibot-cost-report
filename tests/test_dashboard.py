@@ -739,6 +739,43 @@ def test_fetch_usd_cny_range():
     print(f"  当前汇率 USD/CNY = {rate}")
 
 
+
+def test_used_models_decoupled():
+    """显示哪些模型不能和「是否计入成本」耦合。"""
+    print("--- used_models 与计费解耦 ---")
+    with tempfile.TemporaryDirectory() as d:
+        db = Path(d) / "t.db"
+        make_db(db)
+        now = datetime(2026, 11, 8, 0, 21, 0)
+        pricing = {"model-a": {"prompt": 0.000001, "input_cache_read": 0.0000001,
+                               "completion": 0.000004}}
+
+        base = dashboard.collect(db, 1, now=now)
+        check("无 pricing 也有 used_models", base["current"]["used_models"], ["model-a"])
+
+        # 关掉计费：成本不变，但 used_models 照常有
+        off = dashboard.collect(db, 1, now=now, pricing=pricing, apply_pricing=False)
+        check("不计费时 used_models 仍有值", off["current"]["used_models"], ["model-a"])
+        check("不计费时总花费不变", round(off["current"]["total_cost"], 4), 9.0)
+        check_true("不计费时仍有 priced_usage 供展示", bool(off["current"].get("priced_usage")))
+
+        # 开启计费：成本并入
+        on = dashboard.collect(db, 1, now=now, pricing=pricing, apply_pricing=True)
+        check_true("计费时总花费变大", on["current"]["total_cost"] > base["current"]["total_cost"])
+
+        # used_models 取 model_identifier，不是显示名
+        con = sqlite3.connect(db)
+        con.execute("INSERT INTO llm_usage (model_name, model_assign_name, timestamp, prompt_tokens, "
+                    "completion_tokens, prompt_cache_hit_tokens, prompt_cache_miss_tokens) "
+                    "VALUES ('provider/gemini-x', 'gemini-x', '2026-11-07 12:00:00', 100, 10, 0, 100)")
+        con.commit(); con.close()
+        con = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True, timeout=10)
+        names = dashboard.used_models(con, datetime(2026, 11, 7, 0, 0), datetime(2026, 11, 8, 0, 0))
+        con.close()
+        check_true("used_models 用带前缀的 identifier", "provider/gemini-x" in names)
+        check_true("不含纯显示名", "gemini-x" not in names)
+
+
 def run(round_no: int) -> bool:
     print(f"\n===== 第 {round_no} 轮 =====")
     before = len(RESULTS)
@@ -764,6 +801,7 @@ def run(round_no: int) -> bool:
     test_magpie_window_stats()
     test_fx_cache()
     test_fetch_usd_cny_range()
+    test_used_models_decoupled()
     return all(RESULTS[before:])
 
 
