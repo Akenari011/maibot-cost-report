@@ -146,6 +146,11 @@ def _progress_row(label: str, percent: float, color: str, right: str = "") -> st
 
 
 def _cache_block(data: dict[str, Any], limit: int = 8) -> str:
+    """Prompt 缓存区块。
+
+    最多只画 4 行：这个区块和「统计概览」同一行，行数多了会把整行撑高，
+    左侧统计概览的迷你柱状图被 stretch 拉得老长，反而难看。
+    """
     current = data["current"]
     cache = current["cache_by_model"]
     if not data["has_cache"]:
@@ -553,7 +558,7 @@ def build(data: dict[str, Any], cfg: Any) -> str:
       <div style="font-size:13px;font-weight:600;margin-bottom:14px">统计概览</div>
       <div style="display:flex;gap:22px;flex:1;min-height:0">{''.join(cards)}</div>
     </div>
-    {_cache_block(data, getattr(cfg, 'top_models', 8))}
+    {_cache_block(data, min(getattr(cfg, 'top_models', 8), 4))}
     {_model_dist_block(data)}
     {_token_flow_block(data)}
     {_efficiency_block(data)}
