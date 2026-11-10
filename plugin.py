@@ -618,9 +618,12 @@ class CostReportPlugin(MaiBotPlugin):
         extra_by_model: dict[str, float] = {}
         prev_extra_by_model: dict[str, float] = {}
         magpie_data = None
-        # 在 if 块外初始化：magpie 关闭时后面也要读它们，否则 NameError
+        # 在 if 块外初始化：magpie 关闭时后面也要读它们，否则 NameError。
+        # count_cost 曾经漏在外面，默认配置（magpie_enabled=false）下 _collect_dashboard
+        # 会直接抛 UnboundLocalError，整条出图路径静默失败。
         pricing: dict[str, dict[str, float]] = {}
         usd_rate = float(getattr(self.config.report, "magpie_usd_rate", 7.2) or 7.2)
+        count_cost = bool(getattr(self.config.report, "magpie_count_cost", True))
         if self.config.report.magpie_enabled:
             url = str(self.config.report.magpie_url or "")
             now = datetime.now()
@@ -629,7 +632,6 @@ class CostReportPlugin(MaiBotPlugin):
             cur_window = await asyncio.to_thread(_magpie.collect_window, url, cur_since)
             prev_window = await asyncio.to_thread(_magpie.collect_window, url, prev_since)
             usd_rate = await self._resolve_usd_rate()
-            count_cost = bool(getattr(self.config.report, "magpie_count_cost", True))
             # 单价表始终拉：即使不计入总花费，也要用它算「本窗口调用/token」和
             # 判断该展示哪些配额池。之前只在 count_cost 时拉，关掉后显示会退回
             # 网关明细，把 magpie 自己探测的 gpt-6-astra 之类也画出来。

@@ -20,6 +20,9 @@ sys.path.insert(0, str(ROOT))
 def load(name):
     spec = importlib.util.spec_from_file_location(f"_test_{name}", ROOT / f"{name}.py")
     module = importlib.util.module_from_spec(spec)
+    # 插件用了 `from __future__ import annotations`，pydantic 解析 RootConfig 的前向引用时
+    # 要能按 __module__ 在 sys.modules 里找回这个模块，否则报 PluginSectionConfig 未定义。
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -843,6 +846,99 @@ def test_match_pools_no_tokens_est():
     check("匹配结果为空", matched, [])
 
 
+def test_send_image_default_config():
+    """默认配置（magpie 关闭）下 `_send_image` 必须能出图。
+
+    回归测试：`count_cost` 曾经只在 `if self.config.report.magpie_enabled:` 分支里
+    赋值，而 `_collect_dashboard` 的调用在分支外面。默认配置 magpie_enabled=False，
+    于是走到那里就是 UnboundLocalError，整的条出图路径静默失败（命令只回文本、
+    工具不回图）。审核机器人报的就是这个阻断项。
+
+    这里不碰真数据库和真 Playwright：db_path 指向临时库，render/send 用假上下文。
+    """
+    print("--- 默认配置出图路径 ---")
+
+    class _Logger:
+        def __init__(self):
+            self.lines = []
+
+        def _rec(self, lvl, msg, *a):
+            self.lines.append(f"{lvl} {msg % a if a else msg}")
+
+        def info(self, m, *a):
+            self._rec("INFO", m, *a)
+
+        def warning(self, m, *a):
+            self._rec("WARN", m, *a)
+
+        def error(self, m, *a):
+            self._rec("ERROR", m, *a)
+
+        def debug(self, m, *a):
+            self._rec("DEBUG", m, *a)
+
+    class _Render:
+        def __init__(self):
+            self.calls = []
+
+        async def html2png(self, html, **kw):
+            self.calls.append(html)
+            return {"image_base64": "ZmFrZQ=="}
+
+    class _Send:
+        def __init__(self):
+            self.images = []
+
+        async def image(self, b64, stream_id):
+            self.images.append((b64, stream_id))
+            return True
+
+    async def _drive(db_path, data_dir):
+        P.RootConfig.model_rebuild()
+        cfg = P.RootConfig()
+        check("默认 magpie_enabled=False", cfg.report.magpie_enabled, False)
+        check("默认 magpie_count_cost=True", cfg.report.magpie_count_cost, True)
+        cfg = cfg.model_copy(
+            update={"report": cfg.report.model_copy(update={"db_path": str(db_path)})}
+        )
+
+        logger, render, send = _Logger(), _Render(), _Send()
+        plugin = P.CostReportPlugin.__new__(P.CostReportPlugin)
+        # config / ctx 在 SDK 里是只读 property，分别读这两个下划线字段
+        plugin._plugin_config_data = {}
+        plugin._plugin_config_instance = cfg
+        plugin._ctx = SimpleNamespace(
+            logger=logger, render=render, send=send,
+            paths=SimpleNamespace(data_dir=str(data_dir)),
+        )
+        try:
+            ok = await plugin._send_image([], 7, {}, "stream-x")
+        except Exception as exc:  # 旧代码在这里抛 UnboundLocalError
+            return ("EXC", f"{type(exc).__name__}: {exc}", render, send, logger)
+        return (ok, None, render, send, logger)
+
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        db = base / "MaiBot.db"
+        con = sqlite3.connect(db)
+        con.executescript(
+            "CREATE TABLE llm_usage (id INTEGER PRIMARY KEY, timestamp REAL,"
+            " model TEXT, prompt_tokens INTEGER, completion_tokens INTEGER,"
+            " total_tokens INTEGER, cache_hit_tokens INTEGER,"
+            " cache_miss_tokens INTEGER, cost REAL);"
+        )
+        con.commit()
+        con.close()
+
+        ok, err, render, send, logger = asyncio.run(_drive(db, base / "data/plugins/x"))
+        check("没有抛异常", err, None)
+        check_true("返回成功", ok is True)
+        check("渲染被调用一次", len(render.calls), 1)
+        check("图片发出去了", len(send.images), 1)
+        bad = [x for x in logger.lines if x.startswith("ERROR") or "UnboundLocal" in x]
+        check("日志里没有错误", bad, [])
+
+
 def run(round_no: int) -> bool:
     print(f"\n===== 第 {round_no} 轮 =====")
     before = len(RESULTS)
@@ -872,6 +968,7 @@ def run(round_no: int) -> bool:
     test_quota_skips_non_window()
     test_quota_merges_accounts()
     test_match_pools_no_tokens_est()
+    test_send_image_default_config()
     return all(RESULTS[before:])
 
 
