@@ -360,71 +360,12 @@ def _period_metrics(
 
 
 
-def _apply_extra_by_model(metrics: dict[str, Any], extra_by_model: dict[str, float]) -> float:
-    """把外部折算成本按模型分摊，返回总增量。
-
-    宿主表里 gemini 这类走订阅的模型 cost 记 0（价目表没配价），成本只在网关侧有。
-    如果只把总额加上去、不分摊到模型，卡片上就会出现「总额含它、模型分布却是 0%」
-    的对不上。这里按模型名精确落位，名字对不上时补一条新记录，保证两边一致。
-    """
-    if not extra_by_model:
-        return 0.0
-    by_name = {m["name"]: m for m in metrics.get("models") or []}
-    added = 0.0
-    for name, amount in extra_by_model.items():
-        amount = float(amount or 0)
-        if amount <= 0:
-            continue
-        model = by_name.get(name)
-        if model is None:
-            model = {
-                "name": name, "requests": 0, "prompt_tokens": 0,
-                "completion_tokens": 0, "tokens": 0, "cost": 0.0,
-            }
-            metrics.setdefault("models", []).append(model)
-            by_name[name] = model
-        model["cost"] = round(model["cost"] + amount, 6)
-        model["extra_cost"] = round(model.get("extra_cost", 0.0) + amount, 6)
-        added += amount
-    metrics["models"].sort(key=lambda m: -m["cost"])
-    return round(added, 6)
-
-
-def _recompute_derived(metrics: dict[str, Any], days: int) -> None:
-    """往 total_cost 里加了额外成本后，把派生指标一起重算，避免口径打架。"""
-    cost = metrics["total_cost"]
-    span_hours = max(1.0, days * 24.0)
-    online = metrics.get("online_minutes") or 0
-    online_hours = online / 60.0 if online > 0 else span_hours
-    messages = metrics["total_messages"]
-    replies = metrics["total_replies"]
-    requests = metrics["total_requests"]
-    metrics["cost_per_hour"] = cost / online_hours
-    metrics["cost_per_message"] = (cost / messages) if messages else 0.0
-    metrics["cost_per_reply"] = (cost / replies) if replies else 0.0
-    metrics["calls_per_reply"] = (requests / replies) if replies else 0.0
-
-
 def collect(
     db_path: Path,
     days: int,
     now: datetime | None = None,
-    extra_by_model: dict[str, float] | None = None,
-    prev_extra_by_model: dict[str, float] | None = None,
-    pricing: dict[str, dict[str, float]] | None = None,
-    usd_rate: float = 7.2,
-    apply_pricing: bool = True,
 ) -> dict[str, Any] | None:
-    """采集一个完整周期的看板数据。数据库打不开返回 None。
-
-    两种方式把「不按 token 计费、但按公开价折算」的开销并进花费：
-
-    - `pricing` + `usd_rate`：网关给了单价（美元/token）时用这个，插件拿 MaiBot 自己的
-      完整 token 量去算，不受网关明细接口条数限制，长窗口也准。这是推荐路径。
-    - `extra_by_model` / `prev_extra_by_model`：直接给现成的按模型成本，测试或特殊场景用。
-
-    都是按模型分摊而不是只加总额，这样「模型花费分布」和总花费才对得上。
-    """
+    """采集一个完整周期的看板数据。数据库打不开返回 None。"""
     if not db_path.is_file():
         return None
     now = now or datetime.now()
@@ -441,44 +382,14 @@ def collect(
         previous = _period_metrics(con, prev_start, prev_end, bots, days)
         series = _hourly_series(con, start, days)
         msg_series = _message_hourly(con, start, days)
-        # 单价计算必须在 con 关闭之前：conn.close() 之后再查会抛异常，
-        # 异常被外层吞掉就表现为「传了 pricing 但成本没变」。
-        # 实际调用过的模型：不管计不计入成本都要有，用来决定卡片展示哪些配额池
+        # 实际调用过的模型（不依赖定价表），用来决定卡片展示哪些模型
         current["used_models"] = used_models(con, start, end)
-        if pricing:
-            usage_detail = priced_usage(con, start, end, pricing, usd_rate)
-            # 供卡片底部展示「本窗口调用 / token / 成本」
-            current["priced_usage"] = usage_detail
-            # apply_pricing 关掉时只展示不并入总花费
-            if apply_pricing:
-                extra_by_model = {
-                    **(extra_by_model or {}),
-                    **{name: item["cost"] for name, item in usage_detail.items()},
-                }
-            prev_extra_by_model = {
-                **(prev_extra_by_model or {}),
-                **priced_cost(con, prev_start, prev_end, pricing, usd_rate),
-            }
     finally:
         con.close()
 
     # 消息序列补进时间序列，缺失的桶按 0
     for point in series:
         point["messages"] = msg_series.get(point["bucket"], 0)
-
-    # 把外部折算成本按模型分摊，再重算派生指标；两个周期都加，环比才有可比性
-    if extra_by_model:
-        added = _apply_extra_by_model(current, extra_by_model)
-        if added:
-            current["total_cost"] = round(current["total_cost"] + added, 6)
-            current["extra_cost"] = added
-            _recompute_derived(current, days)
-    if prev_extra_by_model:
-        added_prev = _apply_extra_by_model(previous, prev_extra_by_model)
-        if added_prev:
-            previous["total_cost"] = round(previous["total_cost"] + added_prev, 6)
-            previous["extra_cost"] = added_prev
-            _recompute_derived(previous, days)
 
     return {
         "days": days,
@@ -491,116 +402,12 @@ def collect(
     }
 
 
-def priced_cost(
-    con: sqlite3.Connection,
-    start: datetime,
-    end: datetime,
-    pricing: dict[str, dict[str, float]],
-    usd_rate: float = 7.2,
-) -> dict[str, float]:
-    """用网关给的单价 × MaiBot 自己的 token 量算成本，返回 {模型: 人民币}。
-
-    为什么不直接用网关的明细成本：`/v1/magpie/usage/requests` 只返回最近 500 条
-    （约 2.6 天），窗口一长就截断。而 `llm_usage` 里有完整历史，token 量准确。
-
-    `pricing` 来自 `/v1/models`，单位是**美元 / token**；乘 `usd_rate` 换成人民币，
-    才能和宿主记的其它模型花费（人民币）相加。
-    """
-    if not pricing or not _table_exists(con, "llm_usage"):
-        return {}
-    try:
-        rows = con.execute(
-            """
-            SELECT COALESCE(NULLIF(model_assign_name, ''), NULLIF(model_name, ''), 'Unknown') AS model,
-                   SUM(COALESCE(prompt_tokens, 0)),
-                   SUM(COALESCE(prompt_cache_hit_tokens, 0)),
-                   SUM(COALESCE(completion_tokens, 0))
-            FROM llm_usage
-            WHERE timestamp >= ? AND timestamp < ?
-            GROUP BY model
-            """,
-            (_fmt(start), _fmt(end)),
-        ).fetchall()
-    except Exception:
-        return {}
-
-    out: dict[str, float] = {}
-    for name, prompt_tokens, hit, completion in rows:
-        price = pricing.get(str(name))
-        if not price:
-            continue
-        prompt_tokens, hit, completion = _int(prompt_tokens), _int(hit), _int(completion)
-        # 未命中 = 输入总量 - 命中量：比直接用 prompt_cache_miss_tokens 稳，
-        # 部分请求服务端没上报缓存字段，那些 token 实际按全价计
-        miss = max(0, prompt_tokens - hit)
-        usd = (
-            hit * float(price.get("input_cache_read") or 0)
-            + miss * float(price.get("prompt") or 0)
-            + completion * float(price.get("completion") or 0)
-        )
-        if usd > 0:
-            out[str(name)] = round(usd * float(usd_rate), 6)
-    return out
-
-
-def priced_usage(
-    con: sqlite3.Connection,
-    start: datetime,
-    end: datetime,
-    pricing: dict[str, dict[str, float]],
-    usd_rate: float = 7.2,
-) -> dict[str, dict[str, Any]]:
-    """按模型统计窗口内的调用次数、token 量和折算成本（人民币）。
-
-    和 `priced_cost` 的区别：这里除了成本还给出次数和 token，供卡片底部展示。
-    数据同样来自 `llm_usage`（完整历史），所以不受网关明细 500 条的限制。
-    """
-    if not pricing or not _table_exists(con, "llm_usage"):
-        return {}
-    try:
-        rows = con.execute(
-            """
-            SELECT COALESCE(NULLIF(model_assign_name, ''), NULLIF(model_name, ''), 'Unknown') AS model,
-                   COUNT(*),
-                   SUM(COALESCE(prompt_tokens, 0)),
-                   SUM(COALESCE(prompt_cache_hit_tokens, 0)),
-                   SUM(COALESCE(completion_tokens, 0))
-            FROM llm_usage
-            WHERE timestamp >= ? AND timestamp < ?
-            GROUP BY model
-            """,
-            (_fmt(start), _fmt(end)),
-        ).fetchall()
-    except Exception:
-        return {}
-
-    out: dict[str, dict[str, Any]] = {}
-    for name, calls, prompt_tokens, hit, completion in rows:
-        price = pricing.get(str(name))
-        if not price:
-            continue
-        prompt_tokens, hit, completion = _int(prompt_tokens), _int(hit), _int(completion)
-        miss = max(0, prompt_tokens - hit)
-        usd = (
-            hit * float(price.get("input_cache_read") or 0)
-            + miss * float(price.get("prompt") or 0)
-            + completion * float(price.get("completion") or 0)
-        )
-        out[str(name)] = {
-            "calls": _int(calls),
-            "input": prompt_tokens,
-            "output": completion,
-            "cost": round(usd * float(usd_rate), 6),
-        }
-    return out
-
-
 def used_models(con: sqlite3.Connection, start: datetime, end: datetime) -> list[str]:
     """窗口内 MaiBot 实际调用过的模型名（取 model_identifier，和网关的模型 id 对齐）。
 
-    和 `priced_cost` 不同，这个不依赖定价表——即使不计入账面成本，
+    和成本统计不同，这个不依赖定价表——即使不计入账面成本，
     也要能判断该在卡片上展示哪些模型，不能退回网关的请求明细
-    （那里混着别的 agent 和 magpie 自己探测 provider 的记录）。
+    （那里混着别的 agent 和网关自己探测 provider 的记录）。
     """
     if not _table_exists(con, "llm_usage"):
         return []

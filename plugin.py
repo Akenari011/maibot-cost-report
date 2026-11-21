@@ -17,7 +17,6 @@ import asyncio
 import importlib.util
 import sqlite3
 import sys
-import time
 import unicodedata
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -55,7 +54,6 @@ def _load_local(name: str) -> Any:
 
 _dashboard = _load_local("dashboard")
 _render = _load_local("render")
-_magpie = _load_local("magpie")
 
 #: 宿主硬性要求：config.toml 必须有 [plugin].config_version，缺失即加载失败。
 SUPPORTED_CONFIG_VERSION = "1.0.0"
@@ -208,71 +206,6 @@ class ReportConfig(PluginConfigBase):
             "order": 9,
         },
     )
-
-    magpie_enabled: bool = Field(
-        default=False,
-        description="是否在卡片上展示 magpie 网关的 Gemini 用量",
-        json_schema_extra={
-            "label": "显示 magpie 用量（可选）",
-            "hint": (
-                "只有你自己跑了 magpie 这类本地反代网关时才需要打开。"
-                "打开后卡片会多一个区块，显示今天用了多少 token、吃掉多少订阅配额。"
-                "没有 magpie 的话保持关闭即可，插件不会发任何额外请求。"
-            ),
-            "order": 10,
-        },
-    )
-
-    magpie_url: str = Field(
-        default="http://127.0.0.1:3425",
-        description="magpie 网关地址",
-        json_schema_extra={
-            "label": "magpie 地址",
-            "hint": (
-                "magpie 的 HTTP 地址，通常跑在本机。"
-                "插件会请求它的 /v1/magpie/usage 和 /v1/magpie/quotas 两个接口。"
-                "拉不到数据时这个区块会整块消失，不影响卡片其它部分。"
-            ),
-            "placeholder": "http://127.0.0.1:3425",
-            "depends_on": "magpie_enabled",
-            "order": 11,
-        },
-    )
-
-    magpie_count_cost: bool = Field(
-        default=True,
-        description="是否把 magpie 的账面成本计入总花费",
-        json_schema_extra={
-            "label": "账面成本计入总花费",
-            "hint": (
-                "开启后，magpie 按公开价折算的成本会按模型并进「总花费」和「模型花费分布」，"
-                "看到的是「如果按量付费要花多少」。"
-                "关掉则只展示用量和配额，总花费仍按宿主记的 token 计费算，"
-                "适合上游是包月订阅、只想看配额消耗的情况。"
-            ),
-            "depends_on": "magpie_enabled",
-            "order": 12,
-        },
-    )
-
-    magpie_usd_rate: float = Field(
-        default=7.2,
-        ge=0.0,
-        description="兜底汇率：自动抓取失败时用这个值",
-        json_schema_extra={
-            "label": "兜底汇率",
-            "hint": (
-                "magpie 返回的 cost 和单价都是**美元**，而宿主记的模型花费是人民币，"
-                "不换算直接相加会把美元当人民币。\n"
-                "插件每 6 小时自动从公开汇率源抓一次，正常不用管这里；"
-                "只有抓取失败（断网/被墙）时才用这个兜底值。"
-            ),
-            "depends_on": "magpie_enabled",
-            "step": 0.1,
-            "order": 13,
-        },
-    )
-
 
 class RootConfig(PluginConfigBase):
     """配置根模型。⚠ `plugin` 节必须显式声明，否则加载失败。"""
@@ -464,6 +397,7 @@ class CostReportPlugin(MaiBotPlugin):
                 required=False,
             ),
         ],
+        visibility="visible",
     )
     async def handle_check_cost(self, days: int = 0, **kwargs):
         cfg = self.config.report
@@ -538,61 +472,13 @@ class CostReportPlugin(MaiBotPlugin):
 
     # ---------------------------------------------------------------- 图片输出
 
-    #: 汇率缓存时长（秒）。公开汇率源一天才更新一次，6 小时足够。
-    FX_TTL = 6 * 3600
-    #: 抓取失败后的重试间隔，别每次都去撞墙
-    FX_RETRY_TTL = 600
-
-    async def _resolve_usd_rate(self) -> float:
-        """取美元兑人民币汇率：缓存命中直接用，过期就重抓，抓不到退回配置值。"""
-        now = time.monotonic()
-        cache = getattr(self, "_fx_cache", None)
-        if cache:
-            rate, stamp, ttl = cache
-            if now - stamp < ttl:
-                return rate
-
-        fetched = await asyncio.to_thread(_magpie.fetch_usd_cny)
-        if fetched:
-            self._fx_cache = (fetched, now, self.FX_TTL)
-            self.ctx.logger.debug("美元汇率已更新: %.4f", fetched)
-            return fetched
-
-        fallback = float(getattr(self.config.report, "magpie_usd_rate", 7.2) or 7.2)
-        # 缓存兜底值但缩短有效期，网络恢复后能尽快换回实时汇率
-        self._fx_cache = (fallback, now, self.FX_RETRY_TTL)
-        self.ctx.logger.debug("汇率抓取失败，暂时用配置值 %.4f", fallback)
-        return fallback
-
-    def _collect_dashboard(
-        self,
-        days: int,
-        extra_by_model: dict[str, float] | None = None,
-        prev_extra_by_model: dict[str, float] | None = None,
-        pricing: dict[str, dict[str, float]] | None = None,
-        usd_rate: float | None = None,
-        apply_pricing: bool = True,
-    ) -> dict[str, Any] | None:
-        """采集 WebUI 统计页那套指标。数据库不可用返回 None。
-
-        `extra_by_model` / `prev_extra_by_model` 是把「不按 token 计费、但按公开价折算」
-        的开销（走订阅额度的 gemini，成本只记在 magpie 网关侧）按模型并进花费，
-        这样「模型花费分布」和总花费才对得上。两个周期都要传，环比才有可比性。
-        """
+    def _collect_dashboard(self, days: int) -> dict[str, Any] | None:
+        """采集 WebUI 统计页那套指标。数据库不可用返回 None。"""
         db_path = self._db_path()
         if db_path is None:
             return None
         try:
-            return _dashboard.collect(
-                db_path, days,
-                extra_by_model=extra_by_model,
-                prev_extra_by_model=prev_extra_by_model,
-                pricing=pricing,
-                usd_rate=usd_rate if usd_rate is not None else float(
-                    getattr(self.config.report, "magpie_usd_rate", 7.2) or 7.2
-                ),
-                apply_pricing=apply_pricing,
-            )
+            return _dashboard.collect(db_path, days)
         except Exception as exc:
             self.ctx.logger.warning("看板数据采集失败，退回简易卡片: %s", exc)
             return None
@@ -611,79 +497,9 @@ class CostReportPlugin(MaiBotPlugin):
         if lock is None:
             lock = self._render_lock = asyncio.Lock()
 
-        # 优先用看板渲染（指标全、带环比）；数据库读不到时退回旧的简易卡片，
-        # 至少还能出一张图，不至于什么都不发。
-        # magpie 用量是可选功能：没开开关就完全不发请求，卡片上也不会多区块。
-        # 开启时顺手把两个周期的账面成本算出来，并进总花费。
-        extra_by_model: dict[str, float] = {}
-        prev_extra_by_model: dict[str, float] = {}
-        magpie_data = None
-        # 在 if 块外初始化：magpie 关闭时后面也要读它们，否则 NameError。
-        # count_cost 曾经漏在外面，默认配置（magpie_enabled=false）下 _collect_dashboard
-        # 会直接抛 UnboundLocalError，整条出图路径静默失败。
-        pricing: dict[str, dict[str, float]] = {}
-        usd_rate = float(getattr(self.config.report, "magpie_usd_rate", 7.2) or 7.2)
-        count_cost = bool(getattr(self.config.report, "magpie_count_cost", True))
-        if self.config.report.magpie_enabled:
-            url = str(self.config.report.magpie_url or "")
-            now = datetime.now()
-            cur_since = _dashboard.align_window(now, days)[0]
-            prev_since = _dashboard.align_window(now - timedelta(days=days), days)[0]
-            cur_window = await asyncio.to_thread(_magpie.collect_window, url, cur_since)
-            prev_window = await asyncio.to_thread(_magpie.collect_window, url, prev_since)
-            usd_rate = await self._resolve_usd_rate()
-            # 单价表始终拉：即使不计入总花费，也要用它算「本窗口调用/token」和
-            # 判断该展示哪些配额池。之前只在 count_cost 时拉，关掉后显示会退回
-            # 网关明细，把 magpie 自己探测的 gpt-6-astra 之类也画出来。
-            pricing = await asyncio.to_thread(_magpie.fetch_pricing, url)
-            if not pricing:
-                self.ctx.logger.debug("magpie 没返回单价表，账面成本按 0 处理")
-            magpie_data = await asyncio.to_thread(_magpie.collect, url)
-            if magpie_data:
-                magpie_data["window"] = cur_window or {}
-                # 网关返回的 cost 是美元，渲染层要按同一汇率换算成人民币
-                magpie_data["usd_rate"] = usd_rate
-                magpie_data["count_cost"] = bool(
-                    getattr(self.config.report, "magpie_count_cost", True)
-                )
-
-            elif extra_by_model:
-                self.ctx.logger.debug("magpie 详情拉取失败，但窗口成本已并入模型花费")
-
-        data = self._collect_dashboard(
-            days, extra_by_model, prev_extra_by_model, pricing or None, usd_rate, count_cost
-        )
+        # 优先用看板渲染（指标全、带环比）；数据库读不到时退回旧的简易卡片。
+        data = self._collect_dashboard(days)
         if data is not None:
-            if magpie_data:
-                # 底部区块用和卡片一致的窗口统计，而不是网关的自然日统计
-                # 只展示 MaiBot 真正调过的模型对应的配额池。
-                # 不能用网关的请求明细：那里混着别的 agent（我调试用的 urllib）、
-                # magpie 自己探测新 provider 的请求，会把没在用的模型和配额池也画出来。
-                # 用 MaiBot 自己记录的模型（llm_usage），不是网关的请求明细
-                used_models = data["current"].get("used_models") or []
-                if not used_models:
-                    used_models = (cur_window or {}).get("models") or []
-                magpie_data["matched"] = _magpie.match_pools(
-                    used_models, magpie_data.get("providers") or []
-                )
-
-                # 用 llm_usage 的完整统计（网关明细只有最近 500 条，长窗口会截断）
-                detail = data["current"].get("priced_usage") or {}
-                if detail:
-                    magpie_data["window_stats"] = {
-                        "calls": sum(int(v.get("calls") or 0) for v in detail.values()),
-                        "input": sum(int(v.get("input") or 0) for v in detail.values()),
-                        "output": sum(int(v.get("output") or 0) for v in detail.values()),
-                        "cost": round(sum(float(v.get("cost") or 0) for v in detail.values()), 6),
-                    }
-                elif cur_window:
-                    magpie_data["window_stats"] = {
-                        "calls": int(cur_window.get("calls") or 0),
-                        "input": int(cur_window.get("input") or 0),
-                        "output": int(cur_window.get("output") or 0),
-                        "cost": float(data["current"].get("extra_cost") or 0),
-                    }
-                data["magpie"] = magpie_data
             html = _render.build(data, self.config.report)
             selector = "body"
             viewport = {"width": 1400, "height": 700}

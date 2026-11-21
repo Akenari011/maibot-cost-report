@@ -29,7 +29,6 @@ def load(name):
 
 dashboard = load("dashboard")
 render = load("render")
-magpie = load("magpie")
 P = load("plugin")
 
 RESULTS = []
@@ -235,224 +234,6 @@ def test_collect_missing_db():
 # ---------------------------------------------------------------- 渲染输出
 
 
-def test_render_blocks():
-    print("--- 渲染区块 ---")
-    with tempfile.TemporaryDirectory() as d:
-        db = Path(d) / "test.db"
-        make_db(db)
-        data = dashboard.collect(db, 1, now=datetime(2026, 11, 8, 0, 21, 0))
-        cfg = SimpleNamespace(currency="元", title="麦麦开销")
-        html = render.build(data, cfg)
-        for block in ("统计概览", "Prompt缓存", "模型花费分布", "Token流向拆解", "单位成本与效率"):
-            check_true(f"含「{block}」", block in html)
-        check_true("含标题", "麦麦开销" in html)
-        check_true("含总花费", "9.00" in html)
-        check_true("含模型名", "model-a" in html)
-        check_true("含环比标签", "%<" in html or "%</span>" in html)
-        # 输入输出比 = 15000 / 3600 ≈ 4.2
-        check_true("输入输出比正确", "4.2 : 1" in html)
-
-    # 空数据也要能出图
-    empty_data = {
-        "days": 1, "start": datetime.now(), "end": datetime.now(),
-        "current": {
-            "total_cost": 0, "total_requests": 0, "total_tokens": 0,
-            "input_tokens": 0, "output_tokens": 0, "cache_hit": 0, "cache_miss": 0,
-            "cache_no_info": 0, "cache_rate": 0, "total_messages": 0, "total_replies": 0,
-            "reply_rate": 0, "online_minutes": 0, "cost_per_hour": 0, "tokens_per_hour": 0,
-            "cost_per_message": 0, "cost_per_reply": 0, "calls_per_reply": 0,
-            "tool_fail_rate": 0, "models": [], "cache_by_model": {},
-        },
-        "previous": {},
-        "series": [],
-        "has_cache": False,
-    }
-    html2 = render.build(empty_data, SimpleNamespace(currency="元", title=""))
-    check_true("空数据不崩", "统计概览" in html2)
-
-
-
-# ---------------------------------------------------------------- magpie（可选功能）
-
-
-def test_magpie_parsing():
-    print("--- magpie 解析 ---")
-    check("日期标签格式", magpie._day_label(datetime(2026, 11, 8)), "Nov 8")
-    check("个位日期不补零", magpie._day_label(datetime(2026, 11, 5)), "Nov 5")
-
-    usage = {
-        "calls": 100, "input": 1000, "output": 100, "cost": 1.5,
-        "series": [
-            {"label": "Nov 7", "calls": 83, "input": 351274, "output": 20272, "cache_read": 3836, "cost": 0.3398},
-            {"label": "Nov 8", "calls": 5, "input": 40409, "output": 599, "cache_read": 0, "cost": 0.0326},
-        ],
-    }
-    day = magpie._pick_day(usage, "Nov 8")
-    check("取当天 calls", day["calls"], 5)
-    check("取当天 input", day["input"], 40409)
-    check("取当天 cost", round(day["cost"], 4), 0.0326)
-    check("取不存在的日期返回 0", magpie._pick_day(usage, "Nov 99")["calls"], 0)
-
-    quotas = {"data": [{
-        "provider": "antigravity", "plan": "Google AI Pro", "user": "a@b.c",
-        "windows": [
-            {"name": "Gemini · 7 days", "used": 0.3481},
-            {"name": "Gemini · 5 hours", "used": 0.1092},
-            {"name": "Claude & GPT · 7 days", "used": 0},
-        ],
-    }]}
-    q = magpie._parse_quota(quotas)
-    providers = q["providers"]
-    check("provider 数量", len(providers), 1)
-    check("套餐名", providers[0]["plan"], "Google AI Pro")
-    check("池子数量", len(providers[0]["pools"]), 2)
-    check("Gemini 7 天配额", round(providers[0]["pools"]["Gemini"]["quota_7d"], 4), 0.3481)
-    check("Gemini 5 小时配额", round(providers[0]["pools"]["Gemini"]["quota_5h"], 4), 0.1092)
-    check("Claude & GPT 也保留", round(providers[0]["pools"]["Claude & GPT"]["quota_7d"], 4), 0.0)
-    check("空数据不崩", magpie._parse_quota({})["providers"], [])
-
-
-def test_match_pools():
-    """只把实际调过的模型映射到对应配额池。"""
-    print("--- 模型到配额池映射 ---")
-    providers = [{
-        "provider": "antigravity", "plan": "Google AI Pro", "account": "a@b.c",
-        "pools": {
-            "Gemini": {"quota_7d": 0.35, "quota_5h": 0.11},
-            "Claude & GPT": {"quota_7d": 0.0, "quota_5h": 0.0},
-        },
-    }]
-    only_gemini = magpie.match_pools(["antigravity/gemini-3.8-flash"], providers)
-    check("只调 gemini 时只返回一个池", len(only_gemini), 1)
-    check("池名", only_gemini[0]["pool"], "Gemini")
-    check("带上命中的模型", only_gemini[0]["models"], ["antigravity/gemini-3.8-flash"])
-
-    both = magpie.match_pools(
-        ["antigravity/gemini-3.8-flash", "antigravity/claude-sonnet"], providers
-    )
-    check("调了两个池就返回两个", len(both), 2)
-    check("Claude & GPT 命中", any(x["pool"] == "Claude & GPT" for x in both), True)
-
-    check("没调任何模型返回空", magpie.match_pools([], providers), [])
-    check("模型对不上任何池返回空", magpie.match_pools(["deepseek-v4.1-flash"], providers), [])
-    check("空 providers 不崩", magpie.match_pools(["a/gemini-x"], []), [])
-
-
-def test_magpie_collect_failures():
-    print("--- magpie 失败处理 ---")
-    check("空地址返回 None", magpie.collect(""), None)
-    check("连不上返回 None", magpie.collect("http://127.0.0.1:1", timeout=1), None)
-    check("地址无效返回 None", magpie.collect("不是地址", timeout=1), None)
-
-
-def test_render_magpie_block():
-    print("--- magpie 渲染 ---")
-    with tempfile.TemporaryDirectory() as d:
-        db = Path(d) / "test.db"
-        make_db(db)
-        data = dashboard.collect(db, 1, now=datetime(2026, 11, 8, 0, 21, 0))
-        cfg = SimpleNamespace(currency="元", title="麦麦开销")
-
-        # 不开启时不该出现这个区块
-        html_off = render.build(data, cfg)
-        check_true("未开启时无 magpie 区块", "来自 magpie 网关" not in html_off)
-
-        # 开启后出现
-        data["magpie"] = {
-            "today": {"calls": 5, "input": 40409, "output": 599, "cache_read": 0, "cost": 0.0326},
-            "yesterday": {"calls": 83, "input": 351274, "output": 20272, "cache_read": 3836, "cost": 0.3398},
-            "total_30d": {"calls": 2418, "input": 9602063, "output": 532846, "cost": 9.2009},
-            "window": {"models": ["antigravity/gemini-3.8-flash"], "truncated": False},
-            "matched": [{
-                "provider": "antigravity", "plan": "Google AI Pro", "pool": "Gemini",
-                "quota_7d": 0.3481, "quota_5h": 0.1092,
-                "models": ["antigravity/gemini-3.8-flash"],
-            }],
-        }
-        html_on = render.build(data, cfg)
-        check_true("开启后出现区块", "来自 magpie 网关" in html_on)
-        check_true("标题带实际模型名", "gemini-3.8-flash" in html_on)
-        check_true("显示套餐名", "Google AI Pro" in html_on)
-        check_true("显示今日次数", ">5<" in html_on or "5<span" in html_on)
-        check_true("显示配额百分比", "0.35%" in html_on and "99.65%" in html_on)
-        check_true("配额条带池名", "Gemini · 7 天配额" in html_on)
-        check_true("显示昨日对比", "83 次" in html_on)
-
-        # 配额缺失时也要能渲染
-        data["magpie"]["matched"][0]["quota_7d"] = None
-        data["magpie"]["matched"][0]["quota_5h"] = None
-        html_none = render.build(data, cfg)
-        check_true("配额缺失不崩", "gemini-3.8-flash" in html_none)
-
-        # 一个池子都没匹配上时也要能渲染
-        data["magpie"]["matched"] = []
-        html_empty = render.build(data, cfg)
-        check_true("无匹配池不崩", "没有走 magpie 的模型调用" in html_empty)
-
-
-
-def test_extra_cost_merge():
-    """外部折算成本并进总花费后，派生指标要跟着重算。"""
-    print("--- 账面成本并入 ---")
-    with tempfile.TemporaryDirectory() as d:
-        db = Path(d) / "test.db"
-        make_db(db)
-        now = datetime(2026, 11, 8, 0, 21, 0)
-        base = dashboard.collect(db, 1, now=now)
-        merged = dashboard.collect(
-            db, 1, now=now,
-            extra_by_model={"model-a": 0.5},
-            prev_extra_by_model={"model-a": 0.3},
-        )
-
-        check("原始总花费", round(base["current"]["total_cost"], 4), 9.0)
-        check("并入后总花费", round(merged["current"]["total_cost"], 4), 9.5)
-        check("记录额外成本", merged["current"].get("extra_cost"), 0.5)
-        check_true("花费/时间 已重算", merged["current"]["cost_per_hour"] > base["current"]["cost_per_hour"])
-        check_true("花费/消息 已重算", merged["current"]["cost_per_message"] > base["current"]["cost_per_message"])
-        check("上一周期也并入", round(merged["previous"]["total_cost"], 4), 10.3)
-        check("传空时无变化", round(dashboard.collect(db, 1, now=now, extra_by_model={})["current"]["total_cost"], 4), 9.0)
-
-        # 关键：分摊到模型后，模型花费合计必须等于总花费
-        a_model = next(m for m in merged["current"]["models"] if m["name"] == "model-a")
-        check("model-a 的 cost 已加 0.5", round(a_model["cost"], 4), 8.0)
-        check("model-a 记录了 extra_cost", a_model.get("extra_cost"), 0.5)
-        model_sum = round(sum(m["cost"] for m in merged["current"]["models"]), 6)
-        check("模型合计 == 总花费", model_sum, round(merged["current"]["total_cost"], 6))
-        check("模型按花费重排", merged["current"]["models"][0]["name"], "model-a")
-
-        # 宿主表里没有的模型也要补一条，不能静默丢掉
-        extra_new = dashboard.collect(db, 1, now=now, extra_by_model={"gemini-x": 0.7})
-        names = [m["name"] for m in extra_new["current"]["models"]]
-        check_true("未知模型补进列表", "gemini-x" in names)
-        check("补进来的模型带成本", round(next(m for m in extra_new["current"]["models"] if m["name"] == "gemini-x")["cost"], 4), 0.7)
-
-
-def test_collect_window_filter():
-    """窗口过滤只统计 since 之后的请求。"""
-    print("--- magpie 窗口过滤 ---")
-    rows = [
-        {"t": "2026-11-07T10:00:00+08:00", "in": 100, "out": 10, "cost": 0.1},
-        {"t": "2026-11-07T12:00:00+08:00", "in": 200, "out": 20, "cost": 0.2},
-        {"t": "2026-11-08T00:00:00+08:00", "in": 300, "out": 30, "cost": 0.3},
-    ]
-    # 直接测内部逻辑：模拟 _get 的返回
-    class FakeGet:
-        pass
-    since = datetime(2026, 11, 7, 11, 0)
-    total_cost = 0.0
-    calls = 0
-    for row in rows:
-        when = datetime.fromisoformat(row["t"]).replace(tzinfo=None)
-        if when < since:
-            continue
-        calls += 1
-        total_cost += row["cost"]
-    check("窗口内次数", calls, 2)
-    check("窗口内成本", round(total_cost, 4), 0.5)
-
-
-
 def test_fallback_models():
     """宿主能力不可用时，直连库能读就该兜底成功。"""
     print("--- 能力失败兜底 ---")
@@ -492,51 +273,6 @@ def test_fallback_models():
 
 
 
-def test_magpie_count_switch():
-    """计入开关：只影响标注和是否并入，不影响用量展示。"""
-    print("--- 账面成本计入开关 ---")
-    with tempfile.TemporaryDirectory() as d:
-        db = Path(d) / "test.db"
-        make_db(db)
-        data = dashboard.collect(db, 1, now=datetime(2026, 11, 8, 0, 21, 0))
-        cfg = SimpleNamespace(currency="元", title="麦麦开销")
-        base_magpie = {
-            "today": {"calls": 5, "input": 40409, "output": 599, "cache_read": 0, "cost": 0.0326},
-            "yesterday": {"calls": 83},
-            "window": {"models": ["a/gemini-x"], "truncated": False},
-            "matched": [{"provider": "p", "plan": "Plan", "pool": "Gemini",
-                         "quota_7d": 0.35, "quota_5h": 0.11, "models": ["a/gemini-x"]}],
-        }
-
-        data["magpie"] = {**base_magpie, "count_cost": True}
-        html_on = render.build(data, cfg)
-        check_true("开启时标注已计入", "账面已计入总花费" in html_on)
-
-        data["magpie"] = {**base_magpie, "count_cost": False}
-        html_off = render.build(data, cfg)
-        check_true("关闭时标注未计入", "账面未计入总花费" in html_off)
-        check_true("关闭时仍展示用量", "本窗口调用" in html_off)
-        check_true("关闭时仍展示配额", "0.35%" in html_off)
-        check_true("关闭时不再出现已计入字样", "账面已计入总花费" not in html_off)
-
-        # 缺 count_cost 字段时按默认「计入」处理
-        data["magpie"] = dict(base_magpie)
-        html_default = render.build(data, cfg)
-        check_true("缺字段时默认计入", "账面已计入总花费" in html_default)
-
-
-def test_config_has_switch():
-    """配置模型里得有这个开关，且默认开启。"""
-    print("--- 配置项存在性 ---")
-    fields = P.ReportConfig.model_fields
-    check_true("存在 magpie_count_cost", "magpie_count_cost" in fields)
-    check("默认值为 True", fields["magpie_count_cost"].default, True)
-    check_true("存在 magpie_enabled", "magpie_enabled" in fields)
-    check("magpie_enabled 默认关闭", fields["magpie_enabled"].default, False)
-    check_true("存在 magpie_url", "magpie_url" in fields)
-
-
-
 def test_online_minutes_interval():
     """在线时长按起止区间与窗口求交集，不采信 duration_minutes。"""
     print("--- 在线时长区间计算 ---")
@@ -572,199 +308,53 @@ def test_online_minutes_interval():
 
 
 
-def test_priced_cost():
-    """单价 × token 量算成本，按汇率换成人民币。"""
-    print("--- 单价计算 ---")
-    with tempfile.TemporaryDirectory() as d:
-        db = Path(d) / "t.db"
-        con = sqlite3.connect(db)
-        con.executescript("""
-            CREATE TABLE llm_usage (
-                id INTEGER PRIMARY KEY, model_name TEXT, model_assign_name TEXT,
-                timestamp TEXT, prompt_tokens INTEGER, completion_tokens INTEGER,
-                prompt_cache_hit_tokens INTEGER, prompt_cache_miss_tokens INTEGER);
-        """)
-        # 1M 输入（其中 400K 命中缓存）+ 100K 输出
-        con.execute("INSERT INTO llm_usage (model_assign_name, timestamp, prompt_tokens, "
-                    "completion_tokens, prompt_cache_hit_tokens, prompt_cache_miss_tokens) "
-                    "VALUES ('a/gemini-x', '2026-11-07 10:00:00', 1000000, 100000, 400000, 600000)")
-        con.commit()
-        con.close()
-
-        pricing = {"a/gemini-x": {"prompt": 0.00000075, "input_cache_read": 0.000000075,
-                                  "completion": 0.00000375}}
-        con = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True, timeout=10)
-        got = dashboard.priced_cost(con, datetime(2026, 11, 7, 0, 0), datetime(2026, 11, 8, 0, 0), pricing, 7.2)
-        con.close()
-        # 400K×0.075/M + 600K×0.75/M + 100K×3.75/M = 0.03 + 0.45 + 0.375 = 0.855 美元
-        # ×7.2 = 6.156 人民币
-        check("按单价算出的成本", round(got["a/gemini-x"], 3), 6.156)
-
-        # 未命中量用 prompt - hit 兜底（服务端漏报 miss 字段时也不会少算）
-        con = sqlite3.connect(db)
-        con.execute("INSERT INTO llm_usage (model_assign_name, timestamp, prompt_tokens, "
-                    "completion_tokens, prompt_cache_hit_tokens, prompt_cache_miss_tokens) "
-                    "VALUES ('a/gemini-x', '2026-11-07 11:00:00', 500000, 0, 0, 0)")
-        con.commit(); con.close()
-        con = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True, timeout=10)
-        got2 = dashboard.priced_cost(con, datetime(2026, 11, 7, 0, 0), datetime(2026, 11, 8, 0, 0), pricing, 7.2)
-        con.close()
-        # 再叠 500K 全价输入 = 0.375 美元 × 7.2 = 2.7
-        check("漏报 miss 时按全价算", round(got2["a/gemini-x"], 3), round(6.156 + 2.7, 3))
-
-        # 没定价的模型不参与
-        con = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True, timeout=10)
-        got3 = dashboard.priced_cost(con, datetime(2026, 11, 7, 0, 0), datetime(2026, 11, 8, 0, 0), {}, 7.2)
-        con.close()
-        check("空定价返回空", got3, {})
-
-
-def test_collect_with_pricing():
-    """collect 传 pricing 时，模型分布和总花费要一起变。"""
-    print("--- collect 接单价 ---")
-    with tempfile.TemporaryDirectory() as d:
-        db = Path(d) / "t.db"
-        make_db(db)
-        pricing = {"model-a": {"prompt": 0.000001, "input_cache_read": 0.0000001,
-                               "completion": 0.000004}}
-        now = datetime(2026, 11, 8, 0, 21, 0)
-        base = dashboard.collect(db, 1, now=now)
-        priced = dashboard.collect(db, 1, now=now, pricing=pricing, usd_rate=7.0)
-        check_true("传定价后总花费变大", priced["current"]["total_cost"] > base["current"]["total_cost"])
-        model_sum = round(sum(m["cost"] for m in priced["current"]["models"]), 6)
-        check("模型合计仍等于总花费", model_sum, round(priced["current"]["total_cost"], 6))
-
-
-
-def test_reset_hint():
-    """配额重置时间转成相对说法。"""
-    print("--- 配额重置提示 ---")
-    from datetime import timedelta
-    now = datetime.now().astimezone()
-    check_true("7 天后", "7 天后重置" in render._reset_hint((now + timedelta(days=7, hours=1)).isoformat()))
-    check_true("5 小时后", "5 小时后重置" in render._reset_hint((now + timedelta(hours=5, minutes=1)).isoformat()))
-    # 用 29~30 分钟容忍测试内的毫秒级时间差
-    minute_hint = render._reset_hint((now + timedelta(minutes=30)).isoformat())
-    check_true("分钟级提示", minute_hint.endswith("分钟后重置") and minute_hint.split(" ")[0].isdigit())
-    check("已过期返回即将重置", render._reset_hint((now - timedelta(hours=1)).isoformat()), "即将重置")
-    check("空值返回空", render._reset_hint(None), "")
-    check("坏值返回空", render._reset_hint("不是时间"), "")
-    # Z 结尾的 UTC 也能解析
-    check_true("UTC 的 Z 后缀", render._reset_hint("2099-01-01T00:00:00Z") != "")
-
-
-def test_magpie_window_stats():
-    """底部区块优先用窗口统计，并且配额条带重置提示。"""
-    print("--- 窗口统计与重置提示 ---")
+def test_render_blocks():
+    print("--- 渲染区块 ---")
     with tempfile.TemporaryDirectory() as d:
         db = Path(d) / "test.db"
         make_db(db)
         data = dashboard.collect(db, 1, now=datetime(2026, 11, 8, 0, 21, 0))
         cfg = SimpleNamespace(currency="元", title="麦麦开销")
-        from datetime import timedelta
-        soon = (datetime.now().astimezone() + timedelta(days=6)).isoformat()
-        data["magpie"] = {
-            "window_stats": {"calls": 88, "input": 391683, "output": 20871, "cost": 2.68},
-            "today": {"calls": 5, "input": 40409, "output": 599, "cost": 0.0326},
-            "yesterday": {"calls": 83},
-            "count_cost": True,
-            "usd_rate": 7.2,
-            "window": {"models": ["a/gemini-x"], "truncated": False},
-            "matched": [{"provider": "p", "plan": "Plan", "pool": "Gemini",
-                         "quota_7d": 0.35, "quota_5h": 0.11,
-                         "reset_7d": soon, "reset_5h": soon,
-                         "models": ["a/gemini-x"]}],
-        }
         html = render.build(data, cfg)
-        check_true("用窗口调用次数（88 不是 5）", ">88<" in html)
-        check_true("标签是「本窗口调用」", "本窗口调用" in html)
-        check_true("窗口成本用人民币原值", "¥2.68" in html or "¥2.6800" in html)
-        check_true("配额条带重置提示", "天后重置" in html)
-        check_true("不再出现「今日调用」", "今日调用" not in html)
+        for block in ("统计概览", "Prompt缓存", "模型花费分布", "Token流向拆解", "单位成本与效率"):
+            check_true(f"含「{block}」", block in html)
+        check_true("含标题", "麦麦开销" in html)
+        check_true("含总花费", "9.00" in html)
+        check_true("含模型名", "model-a" in html)
+        check_true("含环比标签", "%<" in html or "%</span>" in html)
+        # 输入输出比 = 15000 / 3600 ≈ 4.2
+        check_true("输入输出比正确", "4.2 : 1" in html)
 
-
-
-def test_fx_cache():
-    """汇率缓存：命中不重抓，过期重抓，抓不到用兜底。"""
-    print("--- 汇率缓存 ---")
-    from types import MethodType
-    import time as _time
-
-    class Fake:
-        FX_TTL = 3600
-        FX_RETRY_TTL = 60
-
-    def make(rate_sequence):
-        f = Fake()
-        f.ctx = SimpleNamespace(logger=SimpleNamespace(debug=lambda *a, **k: None))
-        f.config = SimpleNamespace(report=SimpleNamespace(magpie_usd_rate=7.0))
-        f._resolve_usd_rate = MethodType(P.CostReportPlugin._resolve_usd_rate, f)
-        calls = {"n": 0}
-        def fake_fetch(timeout=5.0):
-            value = rate_sequence[min(calls["n"], len(rate_sequence) - 1)]
-            calls["n"] += 1
-            return value
-        P._magpie.fetch_usd_cny = fake_fetch
-        return f, calls
-
-    original = P._magpie.fetch_usd_cny
-    try:
-        f, calls = make([6.5, 9.9])
-        first = asyncio.run(f._resolve_usd_rate())
-        check("首次抓到实时汇率", first, 6.5)
-        second = asyncio.run(f._resolve_usd_rate())
-        check("缓存命中不再重抓", second, 6.5)
-        check("只抓了一次", calls["n"], 1)
-
-        # 过期后重抓
-        f._fx_cache = (6.5, _time.monotonic() - 7200, 3600)
-        third = asyncio.run(f._resolve_usd_rate())
-        check("过期后重抓", third, 9.9)
-
-        # 抓不到时退回配置值
-        g, _ = make([None])
-        fallback = asyncio.run(g._resolve_usd_rate())
-        check("抓不到用兜底", fallback, 7.0)
-        check("兜底值也被缓存", g._fx_cache[0], 7.0)
-        check("兜底缓存用短 TTL", g._fx_cache[2], Fake.FX_RETRY_TTL)
-    finally:
-        P._magpie.fetch_usd_cny = original
-
-
-def test_fetch_usd_cny_range():
-    """真实汇率源：能通就校验范围，不通就跳过（不依赖网络）。"""
-    print("--- 汇率源（可选）---")
-    rate = magpie.fetch_usd_cny(timeout=8)
-    if rate is None:
-        print("  SKIP 网络不可用")
-        return
-    check_true("汇率在合理区间", 1.0 < rate < 20.0)
-    print(f"  当前汇率 USD/CNY = {rate}")
-
+    # 空数据也要能出图
+    empty_data = {
+        "days": 1, "start": datetime.now(), "end": datetime.now(),
+        "current": {
+            "total_cost": 0, "total_requests": 0, "total_tokens": 0,
+            "input_tokens": 0, "output_tokens": 0, "cache_hit": 0, "cache_miss": 0,
+            "cache_no_info": 0, "cache_rate": 0, "total_messages": 0, "total_replies": 0,
+            "reply_rate": 0, "online_minutes": 0, "cost_per_hour": 0, "tokens_per_hour": 0,
+            "cost_per_message": 0, "cost_per_reply": 0, "calls_per_reply": 0,
+            "tool_fail_rate": 0, "models": [], "cache_by_model": {},
+        },
+        "previous": {},
+        "series": [],
+        "has_cache": False,
+    }
+    html2 = render.build(empty_data, SimpleNamespace(currency="元", title=""))
+    check_true("空数据不崩", "统计概览" in html2)
 
 
 def test_used_models_decoupled():
-    """显示哪些模型不能和「是否计入成本」耦合。"""
-    print("--- used_models 与计费解耦 ---")
+    """显示哪些模型只认宿主真实调用，不依赖任何外部定价表。"""
+    print("--- used_models 取自真实调用 ---")
     with tempfile.TemporaryDirectory() as d:
         db = Path(d) / "t.db"
         make_db(db)
         now = datetime(2026, 11, 8, 0, 21, 0)
-        pricing = {"model-a": {"prompt": 0.000001, "input_cache_read": 0.0000001,
-                               "completion": 0.000004}}
 
         base = dashboard.collect(db, 1, now=now)
-        check("无 pricing 也有 used_models", base["current"]["used_models"], ["model-a"])
-
-        # 关掉计费：成本不变，但 used_models 照常有
-        off = dashboard.collect(db, 1, now=now, pricing=pricing, apply_pricing=False)
-        check("不计费时 used_models 仍有值", off["current"]["used_models"], ["model-a"])
-        check("不计费时总花费不变", round(off["current"]["total_cost"], 4), 9.0)
-        check_true("不计费时仍有 priced_usage 供展示", bool(off["current"].get("priced_usage")))
-
-        # 开启计费：成本并入
-        on = dashboard.collect(db, 1, now=now, pricing=pricing, apply_pricing=True)
-        check_true("计费时总花费变大", on["current"]["total_cost"] > base["current"]["total_cost"])
+        check("有 used_models", base["current"]["used_models"], ["model-a"])
+        check("总花费只来自宿主记录", round(base["current"]["total_cost"], 4), 9.0)
 
         # used_models 取 model_identifier，不是显示名
         con = sqlite3.connect(db)
@@ -780,102 +370,29 @@ def test_used_models_decoupled():
 
 
 
-def test_quota_skips_non_window():
-    """Credits / Tokens(est.) 这类不是 7天/5小时窗口，不能塞进配额条。"""
-    print("--- 配额只收 7天/5小时 窗口 ---")
-    quotas = {"data": [
-        {  # workbuddy 一个账户：全是 Credits 类窗口
-            "provider": "workbuddy", "plan": "Free plan", "user": "a",
-            "windows": [
-                {"name": "Credits", "used": 0},
-                {"name": "Extra credits", "used": 11.4},
-                {"name": "Total credits", "used": 10.5},
-                {"name": "deepseek-v4.1-flash tokens (est.)", "used": 0.2},
-            ],
-        },
-        {  # antigravity：标准 7天/5小时
-            "provider": "antigravity", "plan": "Google AI Pro", "user": "b",
-            "windows": [
-                {"name": "Gemini · 7 days", "pool": "Gemini", "used": 2.6},
-                {"name": "Gemini · 5 hours", "pool": "Gemini", "used": 2.8},
-                {"name": "Claude & GPT · 7 days", "pool": "Claude & GPT", "used": 0},
-            ],
-        },
-    ]}
-    out = magpie._parse_quota(quotas)
-    names = {e["provider"] for e in out["providers"]}
-    check("workbuddy 无配额窗口被排除", "workbuddy" in names, False)
-    check_true("antigravity 保留", "antigravity" in names)
-    ag = next(e for e in out["providers"] if e["provider"] == "antigravity")
-    check("只剩 Gemini / Claude & GPT 两个池", sorted(ag["pools"]), ["Claude & GPT", "Gemini"])
-    check("Gemini 7d", round(ag["pools"]["Gemini"]["quota_7d"], 2), 2.6)
-    check("Gemini 5h", round(ag["pools"]["Gemini"]["quota_5h"], 2), 2.8)
-
-
-def test_quota_merges_accounts():
-    """同一 provider 多个账户合并成一条，取已用最大的。"""
-    print("--- 多账户配额合并 ---")
-    quotas = {"data": [
-        {"provider": "workbuddy", "plan": "Free plan", "user": "acc1",
-         "windows": [{"name": "Gemini · 7 days", "pool": "Gemini", "used": 1.0},
-                     {"name": "Gemini · 5 hours", "pool": "Gemini", "used": 0.5}]},
-        {"provider": "workbuddy", "plan": "Free plan", "user": "acc2",
-         "windows": [{"name": "Gemini · 7 days", "pool": "Gemini", "used": 5.0},
-                     {"name": "Gemini · 5 hours", "pool": "Gemini", "used": 3.0}]},
-        {"provider": "workbuddy", "plan": "Free plan", "user": "acc3",
-         "windows": [{"name": "Gemini · 7 days", "pool": "Gemini", "used": 2.0}]},
-    ]}
-    out = magpie._parse_quota(quotas)
-    check("同 provider 只出一条", len(out["providers"]), 1)
-    pools = out["providers"][0]["pools"]
-    check("7d 取最大 5.0", round(pools["Gemini"]["quota_7d"], 1), 5.0)
-    check("5h 取最大 3.0", round(pools["Gemini"]["quota_5h"], 1), 3.0)
-
-
-def test_match_pools_no_tokens_est():
-    """池子名带模型名的（tokens (est.)）不能被误当成该模型的配额池。"""
-    print("--- tokens(est.) 不误匹配 ---")
-    quotas = {"data": [{
-        "provider": "workbuddy", "plan": "Free plan", "user": "a",
-        "windows": [{"name": "deepseek-v4.1-flash tokens (est.)", "used": 0.2}],
-    }]}
-    parsed = magpie._parse_quota(quotas)
-    check("非配额窗口全部跳过，providers 为空", parsed["providers"], [])
-    # 即使强行拿它匹配，也没有池子可用
-    matched = magpie.match_pools(["deepseek-v4.1-flash"], parsed["providers"])
-    check("匹配结果为空", matched, [])
-
 
 def test_send_image_default_config():
-    """默认配置（magpie 关闭）下 `_send_image` 必须能出图。
-
-    回归测试：`count_cost` 曾经只在 `if self.config.report.magpie_enabled:` 分支里
-    赋值，而 `_collect_dashboard` 的调用在分支外面。默认配置 magpie_enabled=False，
-    于是走到那里就是 UnboundLocalError，整的条出图路径静默失败（命令只回文本、
-    工具不回图）。审核机器人报的就是这个阻断项。
-
-    这里不碰真数据库和真 Playwright：db_path 指向临时库，render/send 用假上下文。
-    """
-    print("--- 默认配置出图路径 ---")
+    """默认配置下出图路径不能抛异常（曾经因为漏初始化而 UnboundLocalError）。"""
+    print("--- 出图默认配置 ---")
 
     class _Logger:
         def __init__(self):
             self.lines = []
 
-        def _rec(self, lvl, msg, *a):
-            self.lines.append(f"{lvl} {msg % a if a else msg}")
+        def _rec(self, level):
+            return lambda msg, *a: self.lines.append(f"{level} {msg % a if a else msg}")
 
-        def info(self, m, *a):
-            self._rec("INFO", m, *a)
+        def debug(self, msg, *a):
+            self._rec("DEBUG")(msg, *a)
 
-        def warning(self, m, *a):
-            self._rec("WARN", m, *a)
+        def info(self, msg, *a):
+            self._rec("INFO")(msg, *a)
 
-        def error(self, m, *a):
-            self._rec("ERROR", m, *a)
+        def warning(self, msg, *a):
+            self._rec("WARN")(msg, *a)
 
-        def debug(self, m, *a):
-            self._rec("DEBUG", m, *a)
+        def error(self, msg, *a):
+            self._rec("ERROR")(msg, *a)
 
     class _Render:
         def __init__(self):
@@ -883,28 +400,23 @@ def test_send_image_default_config():
 
         async def html2png(self, html, **kw):
             self.calls.append(html)
-            return {"image_base64": "ZmFrZQ=="}
+            return {"image_base64": "iVBORw0KGgo="}
 
     class _Send:
         def __init__(self):
             self.images = []
 
-        async def image(self, b64, stream_id):
-            self.images.append((b64, stream_id))
+        async def image(self, *a, **kw):
+            self.images.append(a)
+            return True
+
+        async def text(self, *a, **kw):
             return True
 
     async def _drive(db_path, data_dir):
-        P.RootConfig.model_rebuild()
         cfg = P.RootConfig()
-        check("默认 magpie_enabled=False", cfg.report.magpie_enabled, False)
-        check("默认 magpie_count_cost=True", cfg.report.magpie_count_cost, True)
-        cfg = cfg.model_copy(
-            update={"report": cfg.report.model_copy(update={"db_path": str(db_path)})}
-        )
-
         logger, render, send = _Logger(), _Render(), _Send()
         plugin = P.CostReportPlugin.__new__(P.CostReportPlugin)
-        # config / ctx 在 SDK 里是只读 property，分别读这两个下划线字段
         plugin._plugin_config_data = {}
         plugin._plugin_config_instance = cfg
         plugin._ctx = SimpleNamespace(
@@ -913,7 +425,7 @@ def test_send_image_default_config():
         )
         try:
             ok = await plugin._send_image([], 7, {}, "stream-x")
-        except Exception as exc:  # 旧代码在这里抛 UnboundLocalError
+        except Exception as exc:
             return ("EXC", f"{type(exc).__name__}: {exc}", render, send, logger)
         return (ok, None, render, send, logger)
 
@@ -923,9 +435,9 @@ def test_send_image_default_config():
         con = sqlite3.connect(db)
         con.executescript(
             "CREATE TABLE llm_usage (id INTEGER PRIMARY KEY, timestamp REAL,"
-            " model TEXT, prompt_tokens INTEGER, completion_tokens INTEGER,"
-            " total_tokens INTEGER, cache_hit_tokens INTEGER,"
-            " cache_miss_tokens INTEGER, cost REAL);"
+            " model_name TEXT, model_assign_name TEXT, prompt_tokens INTEGER,"
+            " completion_tokens INTEGER, total_tokens INTEGER,"
+            " prompt_cache_hit_tokens INTEGER, prompt_cache_miss_tokens INTEGER, cost REAL);"
         )
         con.commit()
         con.close()
@@ -947,27 +459,10 @@ def run(round_no: int) -> bool:
     test_format()
     test_collect()
     test_collect_missing_db()
-    test_render_blocks()
-    test_magpie_parsing()
-    test_match_pools()
-    test_magpie_collect_failures()
-    test_render_magpie_block()
-    test_extra_cost_merge()
-    test_collect_window_filter()
     test_fallback_models()
-    test_magpie_count_switch()
-    test_config_has_switch()
     test_online_minutes_interval()
-    test_priced_cost()
-    test_collect_with_pricing()
-    test_reset_hint()
-    test_magpie_window_stats()
-    test_fx_cache()
-    test_fetch_usd_cny_range()
+    test_render_blocks()
     test_used_models_decoupled()
-    test_quota_skips_non_window()
-    test_quota_merges_accounts()
-    test_match_pools_no_tokens_est()
     test_send_image_default_config()
     return all(RESULTS[before:])
 

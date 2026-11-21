@@ -358,132 +358,6 @@ def _online_text(minutes: int) -> str:
 
 
 
-def _reset_hint(iso: Any) -> str:
-    """把配额的 ISO 重置时间转成「X 天后重置」这种相对说法。"""
-    text = str(iso or "").strip()
-    if not text:
-        return ""
-    try:
-        when = datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone()
-    except ValueError:
-        return ""
-    seconds = (when - datetime.now().astimezone()).total_seconds()
-    if seconds <= 0:
-        return "即将重置"
-    hours = seconds / 3600
-    if hours >= 24:
-        return f"{int(hours // 24)} 天后重置"
-    if hours >= 1:
-        return f"{int(hours)} 小时后重置"
-    return f"{max(1, int(seconds // 60))} 分钟后重置"
-
-
-def _magpie_block(magpie: dict[str, Any]) -> str:
-    """magpie 网关的订阅用量。只展示 MaiBot 实际调过的模型对应的配额池。"""
-    # 优先用和卡片窗口一致的统计；拿不到才退回自然日
-    stats = magpie.get("window_stats") or magpie.get("today") or {}
-    yesterday = magpie.get("yesterday") or {}
-    matched = magpie.get("matched") or []
-    window = magpie.get("window") or {}
-
-    calls = int(stats.get("calls") or 0)
-    tokens_in = int(stats.get("input") or 0)
-    tokens_out = int(stats.get("output") or 0)
-    # window_stats 的 cost 已经是人民币（按单价算的）；today 的 cost 是美元，要换算
-    if magpie.get("window_stats"):
-        cost = float(stats.get("cost") or 0)
-    else:
-        usd_rate = float(magpie.get("usd_rate") or 7.2)
-        cost = float(stats.get("cost") or 0) * usd_rate
-
-    def quota_bar(label: str, used: float | None, color: str, reset: Any = None) -> str:
-        hint = _reset_hint(reset)
-        hint_html = f"<span style='color:{LIGHT};margin-left:6px'>· {hint}</span>" if hint else ""
-        if used is None:
-            return f"""
-            <div style="flex:1;min-width:0">
-              <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:5px">
-                <span style="color:{GRAY}">{esc(label)}</span>
-                <span style="color:{LIGHT}">—</span>
-              </div>
-              <div style="height:8px;background:#F1F5F9;border-radius:999px"></div>
-            </div>
-            """
-        used = max(0.0, min(100.0, float(used)))
-        return f"""
-        <div style="flex:1;min-width:0">
-          <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:5px">
-            <span style="color:{GRAY}">{esc(label)}</span>
-            <span style="color:#111827;font-variant-numeric:tabular-nums">
-              已用 {used:.2f}% · 剩 {100 - used:.2f}%{hint_html}
-            </span>
-          </div>
-          <div style="height:8px;background:#F1F5F9;border-radius:999px;overflow:hidden">
-            <div style="width:{used:.2f}%;height:100%;background:{color};border-radius:999px"></div>
-          </div>
-        </div>
-        """
-
-    # 标题：优先用实际模型名，没有就退回池子名
-    plan = next((str(m.get("plan") or "") for m in matched if m.get("plan")), "")
-    model_names = []
-    for item in matched:
-        for name in item.get("models") or []:
-            short = str(name).split("/")[-1]
-            if short and short not in model_names:
-                model_names.append(short)
-    heading = "、".join(model_names) if model_names else "订阅用量"
-    heading = f"{heading} · {plan}" if plan else heading
-
-    # 配额条：每个命中的池子一行（7 天 + 5 小时并排）
-    quota_rows = []
-    for item in matched:
-        pool = str(item.get("pool") or "")
-        quota_rows.append(f"""
-        <div style="display:flex;gap:20px;margin-top:{'0' if not quota_rows else '10px'}">
-          {quota_bar(f'{pool} · 7 天配额', item.get('quota_7d'), GREEN, item.get('reset_7d'))}
-          {quota_bar(f'{pool} · 5 小时配额', item.get('quota_5h'), BLUE, item.get('reset_5h'))}
-        </div>
-        """)
-    if not quota_rows:
-        quota_rows.append(f"""
-        <div style="font-size:12px;color:{LIGHT};padding:6px 0">
-          本窗口内没有走 magpie 的模型调用，或配额接口没返回对应池子
-        </div>
-        """)
-
-    delta = ""
-    if yesterday.get("calls"):
-        ratio = calls / yesterday["calls"]
-        delta = f"<span style='color:{LIGHT};font-size:11px;margin-left:8px'>昨日 {yesterday['calls']} 次（{ratio:.2f}×）</span>"
-
-    counted = magpie.get("count_cost", True)
-    note = "来自 magpie 网关 · 账面已计入总花费" if counted else "来自 magpie 网关 · 账面未计入总花费"
-
-    # 不再提示「明细超过 500 条上限」：总花费改用单价 × token 量算，不受明细条数限制，
-    # 留着这行只会让人以为整张卡片都不准。
-    return f"""
-    <div class="card" style="grid-column:1 / -1">
-      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:12px">
-        <span style="font-size:13px;font-weight:600">{esc(heading)}</span>
-        <span style="font-size:11px;color:{LIGHT}">{note}</span>
-      </div>
-      <div style="display:flex;gap:26px;align-items:flex-start">
-        <div style="min-width:180px">
-          <div style="font-size:11px;color:{GRAY};margin-bottom:4px">本窗口调用</div>
-          <div style="font-size:24px;font-weight:700;line-height:1.1">{calls}<span style="font-size:13px;font-weight:500;color:{GRAY};margin-left:3px">次</span>{delta}</div>
-          <div style="display:flex;gap:16px;margin-top:8px;font-size:11px;color:{GRAY}">
-            <span>输入 <b style="color:#111827">{fmt_wan(tokens_in)}</b></span>
-            <span>输出 <b style="color:#111827">{fmt_wan(tokens_out)}</b></span>
-            <span>账面 <b style="color:#111827">¥{fmt_money(cost)}</b></span>
-          </div>
-        </div>
-        <div style="flex:1;min-width:0">{''.join(quota_rows)}</div>
-      </div>
-    </div>
-    """
-
-
 def build(data: dict[str, Any], cfg: Any) -> str:
     """生成完整卡片 HTML。"""
     current = data["current"]
@@ -530,8 +404,6 @@ def build(data: dict[str, Any], cfg: Any) -> str:
         ),
     ]
 
-    magpie = data.get("magpie")
-    magpie_row = _magpie_block(magpie) if magpie else ""
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -562,6 +434,5 @@ def build(data: dict[str, Any], cfg: Any) -> str:
     {_model_dist_block(data)}
     {_token_flow_block(data)}
     {_efficiency_block(data)}
-    {magpie_row}
   </div>
 </body></html>"""
